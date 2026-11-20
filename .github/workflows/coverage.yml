@@ -1,0 +1,119 @@
+name: Coverage
+run-name: |
+  Coverage: ${{
+    github.event_name == 'pull_request' && format('PR #{0} by @{1} - {2}', github.event.pull_request.number, github.actor, github.event.pull_request.title) ||
+    github.event_name == 'push' && github.event.head_commit && format('Push by @{0} - {1}', github.actor, github.event.head_commit.message) ||
+    format('{0} triggered by @{1}', github.event_name, github.actor)
+  }}
+
+# Line-coverage report for the bats suites (#980). Measure only: no
+# threshold, and a separate workflow from tests.yml on purpose. kcov
+# over bats is slow and can be flaky with sourced scripts and
+# subshells, so it must never gate a PR; tests.yml stays the pass/fail
+# signal. Do not make this job a required check.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tests/**"
+      - "scripts/**"
+      - "tools/**"
+      - ".github/workflows/coverage.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Coverage report (non-blocking)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install BATS and kcov build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats binutils-dev build-essential cmake \
+            libssl-dev libcurl4-openssl-dev libelf-dev zlib1g-dev \
+            libdw-dev libiberty-dev
+
+      # kcov is not packaged for Ubuntu 24.04, so it is built from the
+      # v43 release tarball, pinned by sha256. Deps per kcov's
+      # INSTALL.md.
+      - name: Build kcov
+        env:
+          KCOV_VERSION: v43
+          KCOV_SHA256: 4cbba86af11f72de0c7514e09d59c7927ed25df7cebdad087f6d3623213b95bf
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o kcov.tar.gz \
+            "https://github.com/SimonKagstrom/kcov/archive/refs/tags/${KCOV_VERSION}.tar.gz"
+          echo "${KCOV_SHA256}  kcov.tar.gz" | sha256sum -c -
+          mkdir kcov
+          tar -xzf kcov.tar.gz -C kcov --strip-components=1
+          cd kcov
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel "$(nproc)"
+          sudo cmake --install build
+          kcov --version
+
+      # Shell coverage. Same file set as tests.yml. Test failures are
+      # tolerated here: tests.yml is the gate, this step only measures.
+      # No GH_TOKEN, so the label-vocabulary test skips.
+      - name: Shell coverage (kcov over bats)
+        run: |
+          mkdir -p coverage
+          kcov --include-path="$PWD/scripts,$PWD/tests,$PWD/tools" \
+            coverage/shell \
+            bats tests/*.bats scripts/cowork-fallback/tests/*.bats \
+            || echo "::warning::bats exited non-zero under kcov"
+          # kcov leaves an absolute symlink (shell/bats -> its run
+          # directory) that the HTML report does not use; drop it before
+          # upload.
+          find coverage -type l -delete
+          cp coverage/shell/bats.*/cobertura.xml coverage/coverage.xml
+
+      # JS coverage. c8 sets NODE_V8_COVERAGE for every node the cowork
+      # suites spawn. protocol-smoke.js stops its daemon with SIGKILL,
+      # which writes no V8 coverage, so only the in-process `node -e`
+      # tests contribute lines for cowork-vm-service.js.
+      # Runs even if the kcov steps failed: the two reports are
+      # independent.
+      - name: JS coverage (c8 over cowork bats)
+        if: ${{ !cancelled() }}
+        run: |
+          npx --yes c8@12.0.0 \
+            --temp-directory "$RUNNER_TEMP/c8" \
+            --include 'scripts/cowork-fallback/**' \
+            --exclude 'scripts/cowork-fallback/tests/**' \
+            --reporter=lcov --reporter=text-summary \
+            --report-dir coverage/js \
+            bats scripts/cowork-fallback/tests/*.bats \
+            || echo "::warning::bats exited non-zero under c8"
+          cp coverage/js/lcov.info coverage/lcov.info
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: warn
+          retention-days: 14
